@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import csv
 import contextlib
+import copy
 import io
 import json
 import math
@@ -32,7 +33,7 @@ from typing import Iterable
 
 from radix_cache_hybrid import RadixCache as MarconiRadixCache
 from radix_cache_vllm import RadixCache as VLLMPlusRadixCache
-from utils import get_kvs_size, get_mamba_state_size
+from utils import _key_match, get_attn_flops, get_kvs_size, get_mamba1_flops, get_mamba_state_size, get_mlp_flops
 
 
 BlockHash = tuple[int | tuple[int, ...], tuple[int, ...]]
@@ -243,6 +244,158 @@ class SSMCheckpointCache:
                 self.evictions += 1
 
 
+def normalize(values: list[float]) -> list[float]:
+    if not values:
+        return []
+    min_value = min(values)
+    max_value = max(values)
+    if max_value == min_value:
+        return [0.0 for _ in values]
+    return [(value - min_value) / (max_value - min_value) for value in values]
+
+
+class VLLMMarconiEvictionRadixCache(VLLMPlusRadixCache):
+    """vLLM+ radix cache with Marconi-style utility eviction over leaf blocks.
+
+    This keeps radix_cache_vllm's fixed-block insertion and prefix matching.
+    The only changed behavior is victim selection: instead of pure LRU over
+    leaves, choose the leaf with the lowest recency/efficiency utility.
+    """
+
+    def __init__(
+        self,
+        *args,
+        eff_weight: float = 0.0,
+        bootstrap_multiplier: int = 5,
+        candidate_eff_weights: Iterable[float] | None = None,
+        enable_tuning: bool = True,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.eff_weight = eff_weight
+        self.evictions = 0
+        self.enable_tuning = enable_tuning
+        self.bootstrap_multiplier = bootstrap_multiplier
+        self.candidate_eff_weights = list(candidate_eff_weights or [x / 10 for x in range(21)])
+        self.request_history_windowed: list[list[list[int] | None]] = []
+        self.bootstrap_window_size: int | None = None
+        self.num_reqs_before_eviction: int | None = None
+        self.tuned = False
+        self.tree_snapshot = None
+
+    def match_prefix(self, input_token_ids, actually_inserting=True):
+        if actually_inserting and self.enable_tuning and self.tree_snapshot is None:
+            self.tree_snapshot = copy.deepcopy(self)
+
+        prefix_token_ids, nodes_accessed, prefix_len = super().match_prefix(
+            input_token_ids,
+            actually_inserting=actually_inserting,
+        )
+        if actually_inserting and self.enable_tuning and not self.tuned:
+            self.request_history_windowed.append([input_token_ids, None])
+        return prefix_token_ids, nodes_accessed, prefix_len
+
+    def insert(self, token_ids, *args, **kwargs):
+        if self.enable_tuning and not self.tuned and self.request_history_windowed:
+            latest_request = self.request_history_windowed[-1]
+            if latest_request[1] is None:
+                input_token_ids = latest_request[0]
+                input_len = 0
+                if input_token_ids is not None:
+                    input_len = _key_match(input_token_ids, token_ids)
+                latest_request[1] = token_ids[input_len:]
+
+        super().insert(token_ids, *args, **kwargs)
+
+        if (
+            self.enable_tuning
+            and not self.tuned
+            and self.bootstrap_window_size is not None
+            and len(self.request_history_windowed) >= self.bootstrap_window_size
+        ):
+            self.eff_weight = self._tune_eff_weight()
+            self.tuned = True
+
+    def _leaf_flops_efficiency(self, node) -> float:
+        child_len = len(node.value)
+        total_len = len(node.get_all_token_ids())
+        parent_len = total_len - child_len
+        mamba = self.num_ssm_layers * get_mamba1_flops(child_len, self.d, self.n)
+        attn = self.num_attn_layers * (
+            get_attn_flops(total_len, self.d) - get_attn_flops(parent_len, self.d)
+        )
+        mlp = self.num_mlp_layers * (
+            get_mlp_flops(total_len, self.d) - get_mlp_flops(parent_len, self.d)
+        )
+        memory = (
+            self.num_ssm_layers * get_mamba_state_size(self.d, self.n)
+            + self.num_attn_layers * get_kvs_size(child_len, self.d)
+        )
+        return (mamba + attn + mlp) / memory
+
+    def evict(self, bytes_to_remove):
+        if self.use_logical_ts:
+            self.logical_ts += self.time_increment
+
+        if self.enable_tuning and self.num_reqs_before_eviction is None:
+            self.num_reqs_before_eviction = len(self.request_history)
+            self.bootstrap_window_size = self.bootstrap_multiplier * self.num_reqs_before_eviction
+
+        bytes_evicted = 0
+        while bytes_evicted < bytes_to_remove:
+            leaves = [leaf for leaf in self._collect_leaves() if leaf != self.root_node]
+            if not leaves:
+                break
+
+            current_ts = self.logical_ts if self.use_logical_ts else 0
+            recency_scores = [
+                1.0 / max(1, current_ts - leaf.last_access_time)
+                for leaf in leaves
+            ]
+            efficiency_scores = [self._leaf_flops_efficiency(leaf) for leaf in leaves]
+
+            normalized_recency = normalize(recency_scores)
+            normalized_efficiency = normalize(efficiency_scores)
+            utility_scores = [
+                recency + self.eff_weight * efficiency
+                for recency, efficiency in zip(normalized_recency, normalized_efficiency)
+            ]
+            victim = leaves[utility_scores.index(min(utility_scores))]
+            bytes_evicted += (
+                self.num_ssm_layers * get_mamba_state_size(self.d, self.n)
+                + self.num_attn_layers * get_kvs_size(len(victim.value), self.d)
+            )
+            self._delete_leaf(victim)
+            self.evictions += 1
+
+    def _tune_eff_weight(self) -> float:
+        if self.tree_snapshot is None:
+            return self.eff_weight
+
+        best_weight = self.eff_weight
+        best_token_hit_rate = -1.0
+        replay_requests = [
+            (input_tokens, output_tokens or [])
+            for input_tokens, output_tokens in self.request_history_windowed
+            if input_tokens is not None
+        ]
+
+        for weight in self.candidate_eff_weights:
+            replay_cache = copy.deepcopy(self.tree_snapshot)
+            replay_cache.enable_tuning = False
+            replay_cache.eff_weight = weight
+            replay_cache.request_history = []
+            for input_tokens, output_tokens in replay_requests:
+                replay_cache.match_prefix(input_tokens)
+                replay_cache.insert(input_tokens + output_tokens)
+            _, token_hit_rate, *_ = replay_cache.get_cache_stats(verbose=False)
+            if token_hit_rate > best_token_hit_rate:
+                best_token_hit_rate = token_hit_rate
+                best_weight = weight
+
+        return best_weight
+
+
 @dataclass(frozen=True)
 class BenchmarkConfig:
     capacity_gb: float
@@ -274,6 +427,64 @@ class BenchmarkConfig:
     @property
     def ssm_checkpoint_bytes(self) -> int:
         return self.num_ssm_layers * get_mamba_state_size(self.d, self.n)
+
+    @property
+    def vllm_plus_block_bytes(self) -> int:
+        return self.kv_block_bytes + self.ssm_checkpoint_bytes
+
+
+def flops_saved(
+    hit_len: int,
+    config: BenchmarkConfig,
+) -> float:
+    return (
+        config.num_ssm_layers * get_mamba1_flops(l=hit_len, d=config.d, n=config.n)
+        + config.num_attn_layers * get_attn_flops(l=hit_len, d=config.d)
+        + config.num_mlp_layers * get_mlp_flops(l=hit_len, d=config.d)
+    )
+
+
+def row_from_stats(
+    cache_type: str,
+    config: BenchmarkConfig,
+    stats: CacheStats,
+    kv_used_bytes: int,
+    ssm_used_bytes: int,
+    kv_cached_blocks: int | str,
+    ssm_cached_checkpoints: int | str,
+    total_flops_saved: float | str = "",
+    num_cached_kv_tokens: int | str = "",
+    kv_cache_fraction: float | str = "",
+    kv_capacity_gb: float | str = "",
+    ssm_capacity_gb: float | str = "",
+    ssm_checkpoint_interval: int | str = "",
+    tuned_eff_weight: float | str = "",
+) -> dict:
+    return {
+        "cache_type": cache_type,
+        "capacity_gb": config.capacity_gb,
+        "kv_cache_fraction": kv_cache_fraction,
+        "kv_capacity_gb": kv_capacity_gb,
+        "ssm_capacity_gb": ssm_capacity_gb,
+        "kv_block_size": config.kv_block_size,
+        "ssm_checkpoint_interval": ssm_checkpoint_interval,
+        "num_requests": stats.request_count,
+        "request_hit_rate": stats.request_hit_rate,
+        "token_hit_rate": stats.token_hit_rate,
+        "avg_hit_tokens_per_hit": stats.avg_hit_tokens_per_hit,
+        "total_input_tokens": stats.total_input_tokens,
+        "total_hit_tokens": stats.total_hit_tokens,
+        "kv_used_gb": kv_used_bytes / 1_000_000_000,
+        "ssm_used_gb": ssm_used_bytes / 1_000_000_000,
+        "kv_block_bytes": config.kv_block_bytes,
+        "ssm_checkpoint_bytes": config.ssm_checkpoint_bytes,
+        "kv_cached_blocks": kv_cached_blocks,
+        "ssm_cached_checkpoints": ssm_cached_checkpoints,
+        "evictions": stats.evictions,
+        "total_flops_saved": total_flops_saved,
+        "num_cached_kv_tokens": num_cached_kv_tokens,
+        "tuned_eff_weight": tuned_eff_weight,
+    }
 
 
 def run_radix_cache_strategy(
@@ -340,7 +551,93 @@ def run_radix_cache_strategy(
         "evictions": "",
         "total_flops_saved": total_mamba_flop_savings + total_attn_flop_savings + total_mlp_flop_savings,
         "num_cached_kv_tokens": num_cached_kv_tokens,
+        "tuned_eff_weight": getattr(radix_cache, "eff_weight", ""),
     }
+
+
+def run_vllm_marconi_eviction_strategy(
+    requests: Iterable[dict],
+    config: BenchmarkConfig,
+    bootstrap_multiplier: int,
+    candidate_eff_weights: list[float],
+) -> dict:
+    cache = VLLMMarconiEvictionRadixCache(
+        capacity_bytes=config.total_capacity_bytes,
+        block_size=config.kv_block_size,
+        num_ssm_layers=config.num_ssm_layers,
+        num_attn_layers=config.num_attn_layers,
+        num_mlp_layers=config.num_mlp_layers,
+        d=config.d,
+        n=config.n,
+        eff_weight=0.0,
+        bootstrap_multiplier=bootstrap_multiplier,
+        candidate_eff_weights=candidate_eff_weights,
+    )
+    stats = CacheStats()
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        for request in requests:
+            input_tokens = request["input_tokens"]
+            output_tokens = request.get("output_tokens", [])
+            cache.match_prefix(input_tokens)
+            cache.insert(input_tokens + output_tokens)
+
+    stats.evictions = cache.evictions
+    request_hit_rate, token_hit_rate, total_mamba_flop_savings, total_attn_flop_savings, total_mlp_flop_savings = (
+        cache.get_cache_stats(verbose=False)
+    )
+    num_cached_mamba_states, num_cached_kv_tokens = cache.get_num_cached_tokens()
+    mamba_state_bytes, kv_state_bytes = cache.get_state_size()
+    total_input_tokens = sum(row[1] for row in cache.request_history)
+    total_hit_tokens = sum(row[2] for row in cache.request_history)
+    request_hits = sum(row[0] for row in cache.request_history)
+    stats.request_count = len(cache.request_history)
+    stats.request_hits = request_hits
+    stats.total_input_tokens = total_input_tokens
+    stats.total_hit_tokens = total_hit_tokens
+    return row_from_stats(
+        cache_type="vllm_marconi_eviction",
+        config=config,
+        stats=stats,
+        kv_used_bytes=kv_state_bytes,
+        ssm_used_bytes=mamba_state_bytes,
+        kv_cached_blocks="",
+        ssm_cached_checkpoints=num_cached_mamba_states,
+        total_flops_saved=total_mamba_flop_savings + total_attn_flop_savings + total_mlp_flop_savings,
+        num_cached_kv_tokens=num_cached_kv_tokens,
+        tuned_eff_weight=cache.eff_weight,
+    )
+
+
+def run_vllm_block_lru_strategy(requests: Iterable[dict], config: BenchmarkConfig) -> dict:
+    cache = BlockPrefixCache(
+        capacity_bytes=config.total_capacity_bytes,
+        block_size=config.kv_block_size,
+        bytes_per_block=config.vllm_plus_block_bytes,
+    )
+    stats = CacheStats()
+    total_flops_saved = 0.0
+
+    for request in requests:
+        input_tokens = request["input_tokens"]
+        output_tokens = request.get("output_tokens", [])
+        hit_len = cache.hit_length(input_tokens)
+        stats.record(len(input_tokens), hit_len)
+        total_flops_saved += flops_saved(hit_len, config)
+        cache.insert(input_tokens + output_tokens)
+
+    stats.evictions = cache.evictions
+    return row_from_stats(
+        cache_type="vllm_block_lru",
+        config=config,
+        stats=stats,
+        kv_used_bytes=len(cache.blocks) * config.kv_block_bytes,
+        ssm_used_bytes=len(cache.blocks) * config.ssm_checkpoint_bytes,
+        kv_cached_blocks=len(cache.blocks),
+        ssm_cached_checkpoints=len(cache.blocks),
+        total_flops_saved=total_flops_saved,
+        num_cached_kv_tokens=len(cache.blocks) * config.kv_block_size,
+    )
 
 
 def run_benchmark(requests: Iterable[dict], config: BenchmarkConfig) -> dict:
@@ -410,6 +707,7 @@ def run_benchmark(requests: Iterable[dict], config: BenchmarkConfig) -> dict:
                 "evictions": stats.evictions,
                 "total_flops_saved": "",
                 "num_cached_kv_tokens": "",
+                "tuned_eff_weight": "",
             }
         )
     return {"rows": rows}
@@ -444,15 +742,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--strategy",
         nargs="+",
-        choices=["simple", "vllm_plus", "marconi", "all"],
-        default=["simple", "vllm_plus", "marconi"],
+        choices=[
+            "simple",
+            "vllm_block_lru",
+            "vllm_plus",
+            "vllm_marconi_eviction",
+            "marconi",
+            "all",
+        ],
+        default=["simple", "vllm_block_lru", "vllm_marconi_eviction", "vllm_plus", "marconi"],
         help=(
             "Cache strategies to run. simple emits kv_only/ssm_only/hybrid_intersection; "
-            "vllm_plus uses token-block checkpointing; marconi uses Marconi V2."
+            "vllm_block_lru and vllm_marconi_eviction use the same full-block "
+            "vLLM-style simulator with different eviction policies; vllm_plus uses "
+            "the repository radix baseline; marconi uses Marconi V2."
         ),
     )
     parser.add_argument("--marconi-eff-weight", type=float, default=0.0)
     parser.add_argument("--marconi-bootstrap-multiplier", type=int, default=5)
+    parser.add_argument(
+        "--vllm-marconi-bootstrap-multiplier",
+        type=int,
+        default=5,
+        help="Bootstrap window multiplier for tuning alpha in vllm_marconi_eviction.",
+    )
+    parser.add_argument(
+        "--vllm-marconi-eff-weights",
+        nargs="+",
+        type=float,
+        default=[x / 10 for x in range(21)],
+        help="Candidate alpha values for vllm_marconi_eviction grid search.",
+    )
     return parser.parse_args()
 
 
@@ -468,6 +788,11 @@ def validate_args(args: argparse.Namespace) -> None:
     for capacity_gb in args.capacity_gb:
         if not math.isfinite(capacity_gb) or capacity_gb < 0:
             raise SystemExit("--capacity-gb values must be finite and non-negative.")
+    if args.vllm_marconi_bootstrap_multiplier <= 0:
+        raise SystemExit("--vllm-marconi-bootstrap-multiplier must be positive.")
+    for weight in args.vllm_marconi_eff_weights:
+        if not math.isfinite(weight) or weight < 0:
+            raise SystemExit("--vllm-marconi-eff-weights values must be finite and non-negative.")
 
 
 def main() -> None:
@@ -475,7 +800,11 @@ def main() -> None:
     validate_args(args)
 
     requests = synthetic_trace() if args.self_test else load_request_trace(args.trace)
-    strategies = {"simple", "vllm_plus", "marconi"} if "all" in args.strategy else set(args.strategy)
+    strategies = (
+        {"simple", "vllm_block_lru", "vllm_plus", "vllm_marconi_eviction", "marconi"}
+        if "all" in args.strategy
+        else set(args.strategy)
+    )
     all_rows: list[dict] = []
     emitted_radix_configs: set[tuple[str, float, int]] = set()
 
@@ -497,6 +826,11 @@ def main() -> None:
                     if "simple" in strategies:
                         result = run_benchmark(requests, config)
                         all_rows.extend(result["rows"])
+                    if "vllm_block_lru" in strategies:
+                        radix_key = ("vllm_block_lru", capacity_gb, kv_block_size)
+                        if radix_key not in emitted_radix_configs:
+                            emitted_radix_configs.add(radix_key)
+                            all_rows.append(run_vllm_block_lru_strategy(requests, config))
                     if "vllm_plus" in strategies:
                         radix_key = ("vllm_plus", capacity_gb, kv_block_size)
                         if radix_key not in emitted_radix_configs:
@@ -508,6 +842,18 @@ def main() -> None:
                                     cache_type="vllm_plus",
                                     cache_cls=VLLMPlusRadixCache,
                                     block_size=kv_block_size,
+                                )
+                            )
+                    if "vllm_marconi_eviction" in strategies:
+                        radix_key = ("vllm_marconi_eviction", capacity_gb, kv_block_size)
+                        if radix_key not in emitted_radix_configs:
+                            emitted_radix_configs.add(radix_key)
+                            all_rows.append(
+                                run_vllm_marconi_eviction_strategy(
+                                    requests,
+                                    config,
+                                    bootstrap_multiplier=args.vllm_marconi_bootstrap_multiplier,
+                                    candidate_eff_weights=args.vllm_marconi_eff_weights,
                                 )
                             )
                     if "marconi" in strategies:

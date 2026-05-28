@@ -24,25 +24,19 @@ matplotlib.rcParams["ps.fonttype"] = 42
 
 
 STRATEGY_LABELS = {
-    "vllm_block_lru": "vLLM block LRU",
     "vllm_plus": "vLLM+",
-    "vllm_marconi_eviction": "vLLM + Marconi eviction",
     "marconi_v2": "Marconi",
     "hybrid_intersection": "Hybrid prefix cache",
 }
 
 STRATEGY_COLORS = {
-    "vllm_block_lru": "#72B7B2",
     "vllm_plus": "#4C78A8",
-    "vllm_marconi_eviction": "#B279A2",
     "marconi_v2": "#F58518",
     "hybrid_intersection": "#54A24B",
 }
 
 STRATEGY_MARKERS = {
-    "vllm_block_lru": "X",
     "vllm_plus": "o",
-    "vllm_marconi_eviction": "P",
     "marconi_v2": "s",
     "hybrid_intersection": "^",
 }
@@ -60,10 +54,9 @@ def strategy_subset(
     df: pd.DataFrame,
     include_simple: bool = False,
     simple_kv_fraction: float | None = None,
-    strategies: Iterable[str] = ("vllm_block_lru", "vllm_marconi_eviction", "vllm_plus", "marconi_v2"),
 ) -> pd.DataFrame:
     """Return rows for Marconi/vLLM+ and, optionally, simple hybrid prefix cache."""
-    strategies = list(strategies)
+    strategies = ["vllm_plus", "marconi_v2"]
     if include_simple:
         strategies.append("hybrid_intersection")
 
@@ -103,19 +96,12 @@ def plot_hit_rate_by_capacity(
     metric: str = "token_hit_rate",
     include_simple: bool = False,
     simple_kv_fraction: float | None = 0.5,
-    strategies: Iterable[str] = ("vllm_block_lru", "vllm_marconi_eviction", "vllm_plus", "marconi_v2"),
     ax: plt.Axes | None = None,
     figsize: tuple[float, float] = (5.2, 3.2),
 ) -> tuple[plt.Figure, plt.Axes]:
     """Plot token or request hit rate versus cache capacity."""
-    strategies = list(strategies)
-    data = strategy_subset(
-        df,
-        include_simple=include_simple,
-        simple_kv_fraction=simple_kv_fraction,
-        strategies=strategies,
-    )
-    strategies = strategies + (["hybrid_intersection"] if include_simple else [])
+    data = strategy_subset(df, include_simple=include_simple, simple_kv_fraction=simple_kv_fraction)
+    strategies = ["vllm_plus", "marconi_v2"] + (["hybrid_intersection"] if include_simple else [])
 
     if ax is None:
         fig, ax = plt.subplots(figsize=figsize, layout="constrained")
@@ -133,19 +119,17 @@ def plot_hit_rate_by_capacity(
 def plot_marconi_vs_vllm_gain(
     df: pd.DataFrame,
     metric: str = "token_hit_rate",
-    candidate: str = "marconi_v2",
-    baseline: str = "vllm_plus",
     ax: plt.Axes | None = None,
     figsize: tuple[float, float] = (5.2, 3.2),
 ) -> tuple[plt.Figure, plt.Axes]:
-    """Plot a candidate strategy's relative gain over a baseline by capacity."""
+    """Plot Marconi's relative gain over vLLM+ by capacity."""
     paired = (
-        df[df["cache_type"].isin([baseline, candidate])]
+        df[df["cache_type"].isin(["vllm_plus", "marconi_v2"])]
         .pivot_table(index="capacity_gb", columns="cache_type", values=metric, aggfunc="first")
-        .dropna(subset=[baseline, candidate])
+        .dropna(subset=["vllm_plus", "marconi_v2"])
         .sort_index()
     )
-    paired["relative_gain"] = (paired[candidate] / paired[baseline] - 1.0) * 100.0
+    paired["relative_gain"] = (paired["marconi_v2"] / paired["vllm_plus"] - 1.0) * 100.0
 
     if ax is None:
         fig, ax = plt.subplots(figsize=figsize, layout="constrained")
@@ -158,13 +142,11 @@ def plot_marconi_vs_vllm_gain(
         marker="D",
         linewidth=2,
         markersize=6,
-        color=STRATEGY_COLORS.get(candidate),
+        color=STRATEGY_COLORS["marconi_v2"],
     )
     ax.axhline(0, color="black", linewidth=0.8)
     ax.set_xlabel("Cache capacity (GB)")
-    candidate_label = STRATEGY_LABELS.get(candidate, candidate)
-    baseline_label = STRATEGY_LABELS.get(baseline, baseline)
-    ax.set_ylabel(f"{candidate_label} gain over {baseline_label} (%)")
+    ax.set_ylabel("Marconi gain over vLLM+ (%)")
     ax.grid(color="lightgrey", linestyle="dashed", axis="y", linewidth=0.8)
     return fig, ax
 
@@ -207,21 +189,14 @@ def plot_cache_memory_usage(
     df: pd.DataFrame,
     include_simple: bool = False,
     simple_kv_fraction: float | None = 0.5,
-    strategies: Iterable[str] = ("vllm_block_lru", "vllm_marconi_eviction", "vllm_plus", "marconi_v2"),
     ax: plt.Axes | None = None,
     figsize: tuple[float, float] = (5.2, 3.2),
 ) -> tuple[plt.Figure, plt.Axes]:
     """Plot total used cache memory for Marconi/vLLM+ and optional simple hybrid."""
-    strategies = list(strategies)
-    data = strategy_subset(
-        df,
-        include_simple=include_simple,
-        simple_kv_fraction=simple_kv_fraction,
-        strategies=strategies,
-    )
+    data = strategy_subset(df, include_simple=include_simple, simple_kv_fraction=simple_kv_fraction)
     data = data.copy()
     data["used_gb"] = data["kv_used_gb"].fillna(0) + data["ssm_used_gb"].fillna(0)
-    strategies = strategies + (["hybrid_intersection"] if include_simple else [])
+    strategies = ["vllm_plus", "marconi_v2"] + (["hybrid_intersection"] if include_simple else [])
 
     if ax is None:
         fig, ax = plt.subplots(figsize=figsize, layout="constrained")
@@ -234,3 +209,4 @@ def plot_cache_memory_usage(
     ax.grid(color="lightgrey", linestyle="dashed", axis="y", linewidth=0.8)
     ax.legend(frameon=False)
     return fig, ax
+
