@@ -18,10 +18,11 @@ def _normalize(values):
             return normalized_values
     return [1] * len(values)  # if list has <=1 elements or all elements are the same
 
-def get_attn_flops(l, d):
+def get_attn_flops(l, d, q_dim=None, kv_dim=None):
     """Gets the number of floating-point operations (FLOPs)
     required in an Attention block.
     Formula (forward only): 8 * L * D^2 + 4 * L^2 * D
+    When q_dim/kv_dim are provided, uses grouped-query projection widths.
     
     Breakdown (operation -> FLOPs):
     - Attention KVQ (linear layer in multi-head self-attention that projects input into
@@ -43,13 +44,18 @@ def get_attn_flops(l, d):
     Returns:
         int: Total FLOPs.
     """
-    return 8 * l * d**2 + 4 * l**2 * d
+    if q_dim is None:
+        q_dim = d
+    if kv_dim is None:
+        kv_dim = d
+    return 2 * l * d * (q_dim + 2 * kv_dim) + 2 * l * q_dim * d + 4 * l**2 * q_dim
 
 
-def get_mlp_flops(l, d):
+def get_mlp_flops(l, d, intermediate_size=None, gated=False):
     """Gets the number of floating-point operations (FLOPs)
     required in a MLP block (two feedforward linear layers).
     Formula (forward only): 2 * 2 * D * (4 * D) * L.
+    When intermediate_size is provided, uses either two or gated three projections.
     
     References:
     - https://www.adamcasson.com/posts/transformer-flops
@@ -62,7 +68,29 @@ def get_mlp_flops(l, d):
     Returns:
         int: Total FLOPs.
     """
-    return 16 * l * d**2
+    if intermediate_size is None:
+        return 16 * l * d**2
+    num_projections = 3 if gated else 2
+    return 2 * num_projections * l * d * intermediate_size
+
+
+def get_linear_attn_flops(
+    l,
+    d,
+    key_dim,
+    value_dim,
+    num_value_heads,
+    key_head_dim,
+    value_head_dim,
+    conv_kernel=4,
+):
+    """Approximate Qwen3.5 Gated DeltaNet linear-attention forward FLOPs."""
+    qkvz_projection = 2 * l * d * (2 * key_dim + 2 * value_dim)
+    ba_projection = 2 * l * d * (2 * num_value_heads)
+    conv = 2 * l * (2 * key_dim + value_dim) * conv_kernel
+    recurrent_update = 6 * l * num_value_heads * key_head_dim * value_head_dim
+    out_projection = 2 * l * value_dim * d
+    return qkvz_projection + ba_projection + conv + recurrent_update + out_projection
 
 
 def get_mamba1_flops(l, d, n):
@@ -107,8 +135,9 @@ def get_mamba1_flops(l, d, n):
     return 12 * l * d**2 + 16 * l * d * n + 10 * l * d  # correct version
 
 
-def get_kvs_size(l, d):
+def get_kvs_size(l, d, num_key_value_heads=None, head_dim=None, bytes_per_param=2):
     """Returns the size of the KV cache of an Attention layer in bytes.
+    When num_key_value_heads/head_dim are provided, uses GQA KV width.
 
     Args:
         l (int): Sequence length.
@@ -117,8 +146,24 @@ def get_kvs_size(l, d):
     Returns:
         int: KV cache size in bytes
     """
-    # 2 is for k and v; d_model is essentially n_heads * d_head; fp16 is 2 bytes/parameter
-    return 2 * l * d * 2
+    if num_key_value_heads is not None and head_dim is not None:
+        d = num_key_value_heads * head_dim
+    # 2 is for k and v; fp16/bf16 is 2 bytes/parameter by default
+    return 2 * l * d * bytes_per_param
+
+
+def get_linear_attention_state_size(
+    num_value_heads,
+    key_head_dim,
+    value_head_dim,
+    conv_dim,
+    conv_kernel=4,
+    bytes_per_param=2,
+):
+    """Return Qwen3.5 Gated DeltaNet recurrent + conv state bytes per layer."""
+    recurrent_state = num_value_heads * key_head_dim * value_head_dim
+    conv_state = conv_dim * conv_kernel
+    return (recurrent_state + conv_state) * bytes_per_param
 
 
 def get_mamba_state_size(d, n, conv_kernel=4, expand=2):

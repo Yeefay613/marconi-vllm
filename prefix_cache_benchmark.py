@@ -33,7 +33,53 @@ from typing import Iterable
 
 from radix_cache_hybrid import RadixCache as MarconiRadixCache
 from radix_cache_vllm import RadixCache as VLLMPlusRadixCache
-from utils import _key_match, get_attn_flops, get_kvs_size, get_mamba1_flops, get_mamba_state_size, get_mlp_flops
+from utils import (
+    _key_match,
+    get_attn_flops,
+    get_kvs_size,
+    get_linear_attention_state_size,
+    get_linear_attn_flops,
+    get_mlp_flops,
+)
+
+
+QWEN35_4B_MODEL_NAME = "Qwen3.5-4B"
+QWEN35_4B_NUM_HIDDEN_LAYERS = 32
+QWEN35_4B_NUM_ATTN_LAYERS = 8
+QWEN35_4B_NUM_LINEAR_ATTN_LAYERS = 24
+QWEN35_4B_HIDDEN_SIZE = 2560
+QWEN35_4B_INTERMEDIATE_SIZE = 9216
+QWEN35_4B_NUM_ATTN_HEADS = 16
+QWEN35_4B_NUM_KV_HEADS = 4
+QWEN35_4B_HEAD_DIM = 256
+QWEN35_4B_LINEAR_NUM_KEY_HEADS = 16
+QWEN35_4B_LINEAR_NUM_VALUE_HEADS = 32
+QWEN35_4B_LINEAR_KEY_HEAD_DIM = 128
+QWEN35_4B_LINEAR_VALUE_HEAD_DIM = 128
+QWEN35_4B_LINEAR_CONV_KERNEL = 4
+
+LEGACY_SIMPLE_FIELDNAMES = [
+    "cache_type",
+    "capacity_gb",
+    "kv_cache_fraction",
+    "kv_capacity_gb",
+    "ssm_capacity_gb",
+    "kv_block_size",
+    "ssm_checkpoint_interval",
+    "num_requests",
+    "request_hit_rate",
+    "token_hit_rate",
+    "avg_hit_tokens_per_hit",
+    "total_input_tokens",
+    "total_hit_tokens",
+    "kv_used_gb",
+    "ssm_used_gb",
+    "kv_block_bytes",
+    "ssm_checkpoint_bytes",
+    "kv_cached_blocks",
+    "ssm_cached_checkpoints",
+    "evictions",
+]
 
 
 BlockHash = tuple[int | tuple[int, ...], tuple[int, ...]]
@@ -320,16 +366,16 @@ class VLLMMarconiEvictionRadixCache(VLLMPlusRadixCache):
         child_len = len(node.value)
         total_len = len(node.get_all_token_ids())
         parent_len = total_len - child_len
-        mamba = self.num_ssm_layers * get_mamba1_flops(child_len, self.d, self.n)
+        mamba = self.num_ssm_layers * self._ssm_flops(child_len)
         attn = self.num_attn_layers * (
-            get_attn_flops(total_len, self.d) - get_attn_flops(parent_len, self.d)
+            self._attn_flops(total_len) - self._attn_flops(parent_len)
         )
         mlp = self.num_mlp_layers * (
-            get_mlp_flops(total_len, self.d) - get_mlp_flops(parent_len, self.d)
+            self._mlp_flops(total_len) - self._mlp_flops(parent_len)
         )
         memory = (
-            self.num_ssm_layers * get_mamba_state_size(self.d, self.n)
-            + self.num_attn_layers * get_kvs_size(child_len, self.d)
+            self.num_ssm_layers * self._ssm_state_size()
+            + self.num_attn_layers * self._kv_size(child_len)
         )
         return (mamba + attn + mlp) / memory
 
@@ -362,8 +408,8 @@ class VLLMMarconiEvictionRadixCache(VLLMPlusRadixCache):
             ]
             victim = leaves[utility_scores.index(min(utility_scores))]
             bytes_evicted += (
-                self.num_ssm_layers * get_mamba_state_size(self.d, self.n)
-                + self.num_attn_layers * get_kvs_size(len(victim.value), self.d)
+                self.num_ssm_layers * self._ssm_state_size()
+                + self.num_attn_layers * self._kv_size(len(victim.value))
             )
             self._delete_leaf(victim)
             self.evictions += 1
@@ -402,11 +448,22 @@ class BenchmarkConfig:
     kv_cache_fraction: float
     kv_block_size: int
     ssm_checkpoint_interval: int
+    model_name: str
     num_attn_layers: int
     num_ssm_layers: int
     num_mlp_layers: int
     d: int
     n: int
+    intermediate_size: int
+    gated_mlp: bool
+    num_attn_heads: int
+    num_key_value_heads: int
+    head_dim: int
+    linear_num_key_heads: int
+    linear_num_value_heads: int
+    linear_key_head_dim: int
+    linear_value_head_dim: int
+    linear_conv_kernel: int
 
     @property
     def total_capacity_bytes(self) -> int:
@@ -422,11 +479,25 @@ class BenchmarkConfig:
 
     @property
     def kv_block_bytes(self) -> int:
-        return self.num_attn_layers * get_kvs_size(self.kv_block_size, self.d)
+        return self.num_attn_layers * get_kvs_size(
+            self.kv_block_size,
+            self.d,
+            num_key_value_heads=self.num_key_value_heads,
+            head_dim=self.head_dim,
+        )
 
     @property
     def ssm_checkpoint_bytes(self) -> int:
-        return self.num_ssm_layers * get_mamba_state_size(self.d, self.n)
+        return self.num_ssm_layers * get_linear_attention_state_size(
+            num_value_heads=self.linear_num_value_heads,
+            key_head_dim=self.linear_key_head_dim,
+            value_head_dim=self.linear_value_head_dim,
+            conv_dim=(
+                2 * self.linear_num_key_heads * self.linear_key_head_dim
+                + self.linear_num_value_heads * self.linear_value_head_dim
+            ),
+            conv_kernel=self.linear_conv_kernel,
+        )
 
     @property
     def vllm_plus_block_bytes(self) -> int:
@@ -438,9 +509,31 @@ def flops_saved(
     config: BenchmarkConfig,
 ) -> float:
     return (
-        config.num_ssm_layers * get_mamba1_flops(l=hit_len, d=config.d, n=config.n)
-        + config.num_attn_layers * get_attn_flops(l=hit_len, d=config.d)
-        + config.num_mlp_layers * get_mlp_flops(l=hit_len, d=config.d)
+        config.num_ssm_layers
+        * get_linear_attn_flops(
+            l=hit_len,
+            d=config.d,
+            key_dim=config.linear_num_key_heads * config.linear_key_head_dim,
+            value_dim=config.linear_num_value_heads * config.linear_value_head_dim,
+            num_value_heads=config.linear_num_value_heads,
+            key_head_dim=config.linear_key_head_dim,
+            value_head_dim=config.linear_value_head_dim,
+            conv_kernel=config.linear_conv_kernel,
+        )
+        + config.num_attn_layers
+        * get_attn_flops(
+            l=hit_len,
+            d=config.d,
+            q_dim=config.num_attn_heads * config.head_dim,
+            kv_dim=config.num_key_value_heads * config.head_dim,
+        )
+        + config.num_mlp_layers
+        * get_mlp_flops(
+            l=hit_len,
+            d=config.d,
+            intermediate_size=config.intermediate_size,
+            gated=config.gated_mlp,
+        )
     )
 
 
@@ -462,6 +555,7 @@ def row_from_stats(
 ) -> dict:
     return {
         "cache_type": cache_type,
+        "model_name": config.model_name,
         "capacity_gb": config.capacity_gb,
         "kv_cache_fraction": kv_cache_fraction,
         "kv_capacity_gb": kv_capacity_gb,
@@ -503,6 +597,16 @@ def run_radix_cache_strategy(
         num_mlp_layers=config.num_mlp_layers,
         d=config.d,
         n=config.n,
+        intermediate_size=config.intermediate_size,
+        gated_mlp=config.gated_mlp,
+        num_attn_heads=config.num_attn_heads,
+        num_key_value_heads=config.num_key_value_heads,
+        head_dim=config.head_dim,
+        linear_num_key_heads=config.linear_num_key_heads,
+        linear_num_value_heads=config.linear_num_value_heads,
+        linear_key_head_dim=config.linear_key_head_dim,
+        linear_value_head_dim=config.linear_value_head_dim,
+        linear_conv_kernel=config.linear_conv_kernel,
         **cache_kwargs,
     )
 
@@ -530,6 +634,7 @@ def run_radix_cache_strategy(
 
     return {
         "cache_type": cache_type,
+        "model_name": config.model_name,
         "capacity_gb": config.capacity_gb,
         "kv_cache_fraction": "",
         "kv_capacity_gb": "",
@@ -569,6 +674,16 @@ def run_vllm_marconi_eviction_strategy(
         num_mlp_layers=config.num_mlp_layers,
         d=config.d,
         n=config.n,
+        intermediate_size=config.intermediate_size,
+        gated_mlp=config.gated_mlp,
+        num_attn_heads=config.num_attn_heads,
+        num_key_value_heads=config.num_key_value_heads,
+        head_dim=config.head_dim,
+        linear_num_key_heads=config.linear_num_key_heads,
+        linear_num_value_heads=config.linear_num_value_heads,
+        linear_key_head_dim=config.linear_key_head_dim,
+        linear_value_head_dim=config.linear_value_head_dim,
+        linear_conv_kernel=config.linear_conv_kernel,
         eff_weight=0.0,
         bootstrap_multiplier=bootstrap_multiplier,
         candidate_eff_weights=candidate_eff_weights,
@@ -686,6 +801,7 @@ def run_benchmark(requests: Iterable[dict], config: BenchmarkConfig) -> dict:
         rows.append(
             {
                 "cache_type": cache_type,
+                "model_name": config.model_name,
                 "capacity_gb": config.capacity_gb,
                 "kv_cache_fraction": config.kv_cache_fraction,
                 "kv_capacity_gb": config.kv_capacity_bytes / 1_000_000_000,
@@ -734,11 +850,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--kv-block-size", nargs="+", type=int, default=[32])
     parser.add_argument("--ssm-checkpoint-interval", nargs="+", type=int, default=[32])
-    parser.add_argument("--num-attn-layers", type=int, default=4)
-    parser.add_argument("--num-ssm-layers", type=int, default=24)
-    parser.add_argument("--num-mlp-layers", type=int, default=28)
-    parser.add_argument("--d", type=int, default=4096)
+    parser.add_argument("--model-name", default=QWEN35_4B_MODEL_NAME)
+    parser.add_argument("--num-attn-layers", type=int, default=QWEN35_4B_NUM_ATTN_LAYERS)
+    parser.add_argument("--num-ssm-layers", type=int, default=QWEN35_4B_NUM_LINEAR_ATTN_LAYERS)
+    parser.add_argument("--num-mlp-layers", type=int, default=QWEN35_4B_NUM_HIDDEN_LAYERS)
+    parser.add_argument("--d", type=int, default=QWEN35_4B_HIDDEN_SIZE)
     parser.add_argument("--n", type=int, default=128)
+    parser.add_argument("--intermediate-size", type=int, default=QWEN35_4B_INTERMEDIATE_SIZE)
+    parser.add_argument("--gated-mlp", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--num-attn-heads", type=int, default=QWEN35_4B_NUM_ATTN_HEADS)
+    parser.add_argument("--num-key-value-heads", type=int, default=QWEN35_4B_NUM_KV_HEADS)
+    parser.add_argument("--head-dim", type=int, default=QWEN35_4B_HEAD_DIM)
+    parser.add_argument("--linear-num-key-heads", type=int, default=QWEN35_4B_LINEAR_NUM_KEY_HEADS)
+    parser.add_argument("--linear-num-value-heads", type=int, default=QWEN35_4B_LINEAR_NUM_VALUE_HEADS)
+    parser.add_argument("--linear-key-head-dim", type=int, default=QWEN35_4B_LINEAR_KEY_HEAD_DIM)
+    parser.add_argument("--linear-value-head-dim", type=int, default=QWEN35_4B_LINEAR_VALUE_HEAD_DIM)
+    parser.add_argument("--linear-conv-kernel", type=int, default=QWEN35_4B_LINEAR_CONV_KERNEL)
     parser.add_argument(
         "--strategy",
         nargs="+",
@@ -773,6 +900,11 @@ def parse_args() -> argparse.Namespace:
         default=[x / 10 for x in range(21)],
         help="Candidate alpha values for vllm_marconi_eviction grid search.",
     )
+    parser.add_argument(
+        "--legacy-simple-csv",
+        action="store_true",
+        help="Emit the older simple-strategy CSV columns used by prefix_cache_benchmark_sharegpt.csv.",
+    )
     return parser.parse_args()
 
 
@@ -790,9 +922,30 @@ def validate_args(args: argparse.Namespace) -> None:
             raise SystemExit("--capacity-gb values must be finite and non-negative.")
     if args.vllm_marconi_bootstrap_multiplier <= 0:
         raise SystemExit("--vllm-marconi-bootstrap-multiplier must be positive.")
+    if args.legacy_simple_csv and set(args.strategy) != {"simple"}:
+        raise SystemExit("--legacy-simple-csv is only compatible with --strategy simple.")
     for weight in args.vllm_marconi_eff_weights:
         if not math.isfinite(weight) or weight < 0:
             raise SystemExit("--vllm-marconi-eff-weights values must be finite and non-negative.")
+    positive_model_values = {
+        "--num-attn-layers": args.num_attn_layers,
+        "--num-ssm-layers": args.num_ssm_layers,
+        "--num-mlp-layers": args.num_mlp_layers,
+        "--d": args.d,
+        "--n": args.n,
+        "--intermediate-size": args.intermediate_size,
+        "--num-attn-heads": args.num_attn_heads,
+        "--num-key-value-heads": args.num_key_value_heads,
+        "--head-dim": args.head_dim,
+        "--linear-num-key-heads": args.linear_num_key_heads,
+        "--linear-num-value-heads": args.linear_num_value_heads,
+        "--linear-key-head-dim": args.linear_key_head_dim,
+        "--linear-value-head-dim": args.linear_value_head_dim,
+        "--linear-conv-kernel": args.linear_conv_kernel,
+    }
+    for flag, value in positive_model_values.items():
+        if value <= 0:
+            raise SystemExit(f"{flag} must be positive.")
 
 
 def main() -> None:
@@ -817,11 +970,22 @@ def main() -> None:
                         kv_cache_fraction=kv_cache_fraction,
                         kv_block_size=kv_block_size,
                         ssm_checkpoint_interval=ssm_checkpoint_interval,
+                        model_name=args.model_name,
                         num_attn_layers=args.num_attn_layers,
                         num_ssm_layers=args.num_ssm_layers,
                         num_mlp_layers=args.num_mlp_layers,
                         d=args.d,
                         n=args.n,
+                        intermediate_size=args.intermediate_size,
+                        gated_mlp=args.gated_mlp,
+                        num_attn_heads=args.num_attn_heads,
+                        num_key_value_heads=args.num_key_value_heads,
+                        head_dim=args.head_dim,
+                        linear_num_key_heads=args.linear_num_key_heads,
+                        linear_num_value_heads=args.linear_num_value_heads,
+                        linear_key_head_dim=args.linear_key_head_dim,
+                        linear_value_head_dim=args.linear_value_head_dim,
+                        linear_conv_kernel=args.linear_conv_kernel,
                     )
                     if "simple" in strategies:
                         result = run_benchmark(requests, config)
@@ -872,7 +1036,11 @@ def main() -> None:
                                 )
                             )
 
-    fieldnames = list(all_rows[0].keys()) if all_rows else []
+    if args.legacy_simple_csv:
+        all_rows = [{field: row[field] for field in LEGACY_SIMPLE_FIELDNAMES} for row in all_rows]
+        fieldnames = LEGACY_SIMPLE_FIELDNAMES
+    else:
+        fieldnames = list(all_rows[0].keys()) if all_rows else []
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         with args.output.open("w", newline="") as f:

@@ -11,8 +11,9 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from config_tuner import ConfigTuner
 from utils import (
-    get_attn_flops, get_flops_efficiency, get_kvs_size, get_mamba1_flops,
-    get_mamba_state_size, get_mlp_flops, get_model_state_size,
+    get_attn_flops, get_kvs_size,
+    get_linear_attention_state_size, get_linear_attn_flops, get_mamba1_flops,
+    get_mamba_state_size, get_mlp_flops,
     _key_match, _normalize,
 )
 
@@ -75,6 +76,16 @@ class RadixCache:
         num_mlp_layers: int = 28,
         d: int = 4096,  # D
         n: int = 128,  # N
+        intermediate_size: int = None,
+        gated_mlp: bool = False,
+        num_attn_heads: int = None,
+        num_key_value_heads: int = None,
+        head_dim: int = None,
+        linear_num_key_heads: int = None,
+        linear_num_value_heads: int = None,
+        linear_key_head_dim: int = None,
+        linear_value_head_dim: int = None,
+        linear_conv_kernel: int = 4,
         capacity_bytes=1e9,  # in bytes
         
         use_logical_ts=True,  # use logical timestamps for exact reproducibility
@@ -93,6 +104,16 @@ class RadixCache:
         self.num_mlp_layers = num_mlp_layers
         self.d = d
         self.n = n
+        self.intermediate_size = intermediate_size
+        self.gated_mlp = gated_mlp
+        self.num_attn_heads = num_attn_heads
+        self.num_key_value_heads = num_key_value_heads
+        self.head_dim = head_dim
+        self.linear_num_key_heads = linear_num_key_heads
+        self.linear_num_value_heads = linear_num_value_heads
+        self.linear_key_head_dim = linear_key_head_dim
+        self.linear_value_head_dim = linear_value_head_dim
+        self.linear_conv_kernel = linear_conv_kernel
         
         self.capacity_bytes = capacity_bytes  # total cache size available in bytes. Defaults to 1GB.
         
@@ -116,6 +137,65 @@ class RadixCache:
         self.num_reqs_before_eviction = None  # number of requests the cache could house prior to the first eviction
         self.bootstrap_multiplier = bootstrap_multiplier
         self.bootstrap_window_size = None  # bootstrap_multiplier * num_reqs_before_eviction
+
+    def _kv_size(self, num_tokens):
+        return get_kvs_size(
+            num_tokens,
+            self.d,
+            num_key_value_heads=self.num_key_value_heads,
+            head_dim=self.head_dim,
+        )
+
+    def _ssm_state_size(self):
+        if (
+            self.linear_num_key_heads is not None
+            and self.linear_num_value_heads is not None
+            and self.linear_key_head_dim is not None
+            and self.linear_value_head_dim is not None
+        ):
+            return get_linear_attention_state_size(
+                num_value_heads=self.linear_num_value_heads,
+                key_head_dim=self.linear_key_head_dim,
+                value_head_dim=self.linear_value_head_dim,
+                conv_dim=(
+                    2 * self.linear_num_key_heads * self.linear_key_head_dim
+                    + self.linear_num_value_heads * self.linear_value_head_dim
+                ),
+                conv_kernel=self.linear_conv_kernel,
+            )
+        return get_mamba_state_size(self.d, self.n)
+
+    def _ssm_flops(self, num_tokens):
+        if (
+            self.linear_num_key_heads is not None
+            and self.linear_num_value_heads is not None
+            and self.linear_key_head_dim is not None
+            and self.linear_value_head_dim is not None
+        ):
+            return get_linear_attn_flops(
+                num_tokens,
+                self.d,
+                key_dim=self.linear_num_key_heads * self.linear_key_head_dim,
+                value_dim=self.linear_num_value_heads * self.linear_value_head_dim,
+                num_value_heads=self.linear_num_value_heads,
+                key_head_dim=self.linear_key_head_dim,
+                value_head_dim=self.linear_value_head_dim,
+                conv_kernel=self.linear_conv_kernel,
+            )
+        return get_mamba1_flops(num_tokens, self.d, self.n)
+
+    def _attn_flops(self, num_tokens):
+        q_dim = self.num_attn_heads * self.head_dim if self.num_attn_heads and self.head_dim else None
+        kv_dim = self.num_key_value_heads * self.head_dim if self.num_key_value_heads and self.head_dim else None
+        return get_attn_flops(num_tokens, self.d, q_dim=q_dim, kv_dim=kv_dim)
+
+    def _mlp_flops(self, num_tokens):
+        return get_mlp_flops(
+            num_tokens,
+            self.d,
+            intermediate_size=self.intermediate_size,
+            gated=self.gated_mlp,
+        )
     
     def insert(
         self,
@@ -161,8 +241,8 @@ class RadixCache:
     
         num_extra_tokens = len(token_ids) - prefix_len  # needs to store their KVs
         num_extra_mamba_states = 2 if branchoff_required else 1
-        bytes_needed = num_extra_mamba_states * self.num_ssm_layers * get_mamba_state_size(self.d, self.n) + \
-            self.num_attn_layers * get_kvs_size(num_extra_tokens, self.d)  # to insert this new sequence
+        bytes_needed = num_extra_mamba_states * self.num_ssm_layers * self._ssm_state_size() + \
+            self.num_attn_layers * self._kv_size(num_extra_tokens)  # to insert this new sequence
         
         if self.get_tree_size() + bytes_needed > self.capacity_bytes:  # insertion will lead to overflow
             bytes_to_remove = self.get_tree_size() + bytes_needed - self.capacity_bytes
@@ -188,8 +268,8 @@ class RadixCache:
         
     def get_state_size(self):
         num_cached_mamba_states, num_cached_kv_tokens = self.get_num_cached_tokens()
-        mamba_state_size = self.num_ssm_layers * num_cached_mamba_states * get_mamba_state_size(self.d, self.n)
-        attn_state_size = self.num_attn_layers * get_kvs_size(num_cached_kv_tokens, self.d)
+        mamba_state_size = self.num_ssm_layers * num_cached_mamba_states * self._ssm_state_size()
+        attn_state_size = self.num_attn_layers * self._kv_size(num_cached_kv_tokens)
         return mamba_state_size, attn_state_size
         
     def get_cache_stats(self, verbose=True, last_n=None):
@@ -201,9 +281,9 @@ class RadixCache:
         num_total_tokens = sum([x[1] for x in request_history])
         num_tokens_saved = sum([x[2] for x in request_history])
         
-        total_mamba_flop_savings = self.num_ssm_layers * get_mamba1_flops(l=num_tokens_saved, d=self.d, n=self.n)
-        total_attn_flop_savings = sum([self.num_attn_layers * get_attn_flops(l=x[2], d=self.d) for x in request_history])
-        total_mlp_flop_savings = sum([self.num_mlp_layers * get_mlp_flops(l=x[2], d=self.d) for x in request_history])
+        total_mamba_flop_savings = self.num_ssm_layers * self._ssm_flops(num_tokens_saved)
+        total_attn_flop_savings = sum([self.num_attn_layers * self._attn_flops(x[2]) for x in request_history])
+        total_mlp_flop_savings = sum([self.num_mlp_layers * self._mlp_flops(x[2]) for x in request_history])
         
         request_hit_rate = sum([x[0] for x in request_history]) / num_requests_recorded
         token_hit_rate = num_tokens_saved / num_total_tokens
@@ -263,7 +343,19 @@ class RadixCache:
         return prefix_token_ids, nodes_accessed, branchoff_required, prefix_len
 
     def get_flops_efficiency_list(self):
-        return [get_flops_efficiency(l, self.d, self.n, self.num_ssm_layers, self.num_attn_layers, self.num_mlp_layers) for _, l, _ in self.request_history]
+        efficiencies = []
+        for _, l, _ in self.request_history:
+            total_flops_saved = (
+                self.num_ssm_layers * self._ssm_flops(l)
+                + self.num_attn_layers * self._attn_flops(l)
+                + self.num_mlp_layers * self._mlp_flops(l)
+            )
+            total_state_size = (
+                self.num_ssm_layers * self._ssm_state_size()
+                + self.num_attn_layers * self._kv_size(l)
+            )
+            efficiencies.append(total_flops_saved / total_state_size)
+        return efficiencies
 
     def _insert_helper(self, node, key, value, state_at_leaf, state_at_branchoff):   
         if self.evict_policy_version in [1]:  # SGLang-like, all ancestor nodes' timestamps are updated on insertion/prefix matching
@@ -493,7 +585,7 @@ class RadixCache:
             if x == self.root_node:
                 break
 
-            bytes_evicted += self.num_ssm_layers * get_mamba_state_size(self.d, self.n) + self.num_attn_layers * get_kvs_size(len(x.value), self.d)
+            bytes_evicted += self.num_ssm_layers * self._ssm_state_size() + self.num_attn_layers * self._kv_size(len(x.value))
             # print(f"Eviction: Evicting node with keylen {len(x.key)}")
             self._delete_leaf(x)
 
@@ -521,11 +613,11 @@ class RadixCache:
                 
                 if self.evict_policy_version in [2, 3]:
                     # savings are relative to the parent
-                    flops_savings_mamba = self.num_ssm_layers * get_mamba1_flops(seqlen_child, self.d, self.n)
-                    flops_savings_attn = self.num_attn_layers * (get_attn_flops(seqlen_total, self.d) - get_attn_flops(seqlen_parent, self.d))
-                    flops_savings_mlp = self.num_mlp_layers * (get_mlp_flops(seqlen_total, self.d) - get_attn_flops(seqlen_parent, self.d))
+                    flops_savings_mamba = self.num_ssm_layers * self._ssm_flops(seqlen_child)
+                    flops_savings_attn = self.num_attn_layers * (self._attn_flops(seqlen_total) - self._attn_flops(seqlen_parent))
+                    flops_savings_mlp = self.num_mlp_layers * (self._mlp_flops(seqlen_total) - self._mlp_flops(seqlen_parent))
                     total_flops_savings = flops_savings_mamba + flops_savings_attn + flops_savings_mlp
-                    total_memory = self.num_ssm_layers * get_mamba_state_size(self.d, self.n) + self.num_attn_layers * get_kvs_size(seqlen_total, self.d)
+                    total_memory = self.num_ssm_layers * self._ssm_state_size() + self.num_attn_layers * self._kv_size(seqlen_total)
                 else:
                     raise NotImplementedError(f"Using evict_v2 but policy version is {self.evict_policy_version}!")
                 flops_efficiency.append(total_flops_savings / total_memory)
@@ -552,9 +644,8 @@ class RadixCache:
             
             assert len(node_to_evict.children) in [0, 1]
             if len(node_to_evict.children) == 0:
-                bytes_evicted += self.num_ssm_layers * get_mamba_state_size(self.d, self.n) + self.num_attn_layers * get_kvs_size(len(node.value), self.d)
+                bytes_evicted += self.num_ssm_layers * self._ssm_state_size() + self.num_attn_layers * self._kv_size(len(node.value))
                 self._delete_leaf(node_to_evict)
             else:
-                bytes_evicted += self.num_ssm_layers * get_mamba_state_size(self.d, self.n)
+                bytes_evicted += self.num_ssm_layers * self._ssm_state_size()
                 self._evict_intermediate_node(node_to_evict)
-
